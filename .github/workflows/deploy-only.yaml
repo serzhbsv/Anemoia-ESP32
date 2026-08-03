@@ -1,0 +1,201 @@
+name: Deploy to GitHub Pages (only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifacts_run_id:
+        description: 'ID запуска, где лежат артефакты firmware-* (оставьте пустым для последнего успешного)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download all firmware artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: firmware-*
+          merge-multiple: false
+          run-id: ${{ inputs.artifacts_run_id || github.run_id }}
+
+      - name: Check if artifacts exist
+        run: |
+          if [ -z "$(ls -A artifacts/)" ]; then
+            echo "❌ Нет артефактов firmware-*!"
+            echo "Сначала запустите сборку или укажите run-id артефактов."
+            exit 1
+          fi
+          echo "✅ Найдены артефакты:"
+          ls -la artifacts/
+
+      - name: Install mklittlefs
+        run: |
+          curl -sL https://github.com/earlephilhower/mklittlefs/releases/download/4.1.0/x86_64-linux-gnu-mklittlefs-42acb97.tar.gz | tar xz
+          sudo mv mklittlefs/mklittlefs /usr/local/bin/
+          sudo chmod +x /usr/local/bin/mklittlefs
+
+      - name: Assemble WebFlash directory
+        run: |
+          mkdir -p WebFlash/binaries
+          mkdir -p WebFlash/manifests
+          mkdir -p WebFlash/configs
+
+          CONTROLLERS="no_controller gpio nes snes psx"
+          ROTATIONS="rotation1 rotation3"
+          SD_FREQS="sd_freq_80MHz sd_freq_40MHz"
+          DACPINS="dac_gpio25 dac_gpio26"
+          BACKLIGHTS="backlight_off backlight_on"
+          DEMO_MODES="demo_mode_off demo_mode_on"
+          INVERT_COLORS="invert_off invert_on"
+
+          for artifact_dir in artifacts/firmware-*/; do
+            NAME=$(basename "$artifact_dir" | sed 's/^firmware-//')
+            IFS='-' read -r DEVICE DISPLAY SWAP SCREEN_FREQ DEBUG <<< "$NAME"
+            [ "$DEVICE" = "composite" ] && continue
+            BOOTLOADER=$(find "$artifact_dir" -name "*.ino.bootloader.bin")
+            PARTITIONS=$(find "$artifact_dir" -name "*.ino.partitions.bin")
+            FIRMWARE=$(find "$artifact_dir" -name "*.ino.bin" ! -name "*.merged.bin" \
+                                                               ! -name "*.bootloader.bin" \
+                                                               ! -name "*.partitions.bin")
+
+            FW_DEST="binaries/$DEVICE/$DISPLAY/$SWAP/$SCREEN_FREQ/$DEBUG"
+            mkdir -p "WebFlash/$FW_DEST"
+            cp "$BOOTLOADER" "WebFlash/$FW_DEST/bootloader.bin"
+            cp "$PARTITIONS" "WebFlash/$FW_DEST/partitions.bin"
+            cp "$FIRMWARE" "WebFlash/$FW_DEST/firmware.bin"
+
+            CONTROLLER_LIST="$CONTROLLERS"
+            DACPIN_LIST="$DACPINS"
+            BACKLIGHT_LIST="$BACKLIGHTS"
+            DEMO_MODE_LIST="$DEMO_MODES"
+
+            if [ "$DEVICE" = "cyd" ]; then
+              CONTROLLER_LIST="no_controller nes uart"
+              DACPIN_LIST="dac_gpio26"
+              BACKLIGHT_LIST="backlight_on"
+              DEMO_MODE_LIST="demo_mode_on"
+            elif [ "$DEVICE" = "module" ]; then
+              CONTROLLER_LIST="gpio"
+              DACPIN_LIST="dac_gpio26"
+              BACKLIGHT_LIST="backlight_off"
+              DEMO_MODE_LIST="demo_mode_off"
+            elif [ "$DEVICE" = "discrete" ]; then
+              CONTROLLER_LIST="gpio"
+              DACPIN_LIST="dac_gpio25"
+              BACKLIGHT_LIST="backlight_on"
+              DEMO_MODE_LIST="demo_mode_off"
+            fi
+
+            for CONTROLLER in $CONTROLLER_LIST; do
+              for ROTATION in $ROTATIONS; do
+                for SD_FREQ in $SD_FREQS; do
+                  for DACPIN in $DACPIN_LIST; do
+                    for BACKLIGHT in $BACKLIGHT_LIST; do
+                      for DEMO_MODE in $DEMO_MODE_LIST; do
+                        for INVERT in $INVERT_COLORS; do
+                          case "$ROTATION" in rotation1) ROT_VAL=1 ;; rotation3) ROT_VAL=3 ;; esac
+                          case "$DACPIN" in dac_gpio25) DAC_VAL=0 ;; dac_gpio26) DAC_VAL=1 ;; esac
+                          case "$CONTROLLER" in
+                            no_controller) CONTROLLER_VAL=255 ;;
+                            gpio) CONTROLLER_VAL=0 ;;
+                            nes) CONTROLLER_VAL=1 ;;
+                            snes) CONTROLLER_VAL=2 ;;
+                            psx) CONTROLLER_VAL=3 ;;
+                            uart) CONTROLLER_VAL=4 ;;
+                          esac
+                          case "$SD_FREQ" in sd_freq_80MHz) SD_VAL=80 ;; sd_freq_40MHz) SD_VAL=40 ;; esac
+                          case "$BACKLIGHT" in backlight_off) BL_VAL=0 ;; backlight_on) BL_VAL=1 ;; esac
+                          case "$DEMO_MODE" in demo_mode_off) DM_VAL=0 ;; demo_mode_on) DM_VAL=1 ;; esac
+                          case "$INVERT" in invert_off) IV_VAL=0 ;; invert_on) IV_VAL=1 ;; esac
+
+                          CFG_NAME="$DEVICE-$DISPLAY-$BACKLIGHT-$INVERT-$SWAP-$SCREEN_FREQ-$CONTROLLER-$ROTATION-$SD_FREQ-$DACPIN-$DEBUG-$DEMO_MODE"
+                          mkdir -p tmp/fs_stage
+                          printf "$(printf '\\%03o' $ROT_VAL $DAC_VAL $CONTROLLER_VAL $SD_VAL $BL_VAL $DM_VAL $IV_VAL)" \
+                              > tmp/fs_stage/runtime_config.bin
+                          mklittlefs -c tmp/fs_stage -s 0x0F000 "WebFlash/configs/${CFG_NAME}-config.bin"
+                          rm -rf tmp/fs_stage
+
+                          printf '{\n  "name": "Anemoia-ESP32",\n  "version": "1.0.0",\n  "funding_url": "https://ko-fi.com/manalotoshim",\n  "builds": [{\n    "chipFamily": "ESP32",\n    "parts": [\n      { "path": "../%s/bootloader.bin", "offset": 4096 },\n      { "path": "../%s/partitions.bin", "offset": 32768 },\n      { "path": "../%s/firmware.bin",   "offset": 65536 },\n      { "path": "../configs/%s",        "offset": 3866624 }\n    ]\n  }]\n}' \
+                            "$FW_DEST" "$FW_DEST" "$FW_DEST" "${CFG_NAME}-config.bin" \
+                            > "WebFlash/manifests/${CFG_NAME}.json"
+                        done
+                      done
+                    done
+                  done
+                done
+              done
+            done
+          done
+
+          # Composite builds
+          for artifact_dir in artifacts/firmware-composite-*/; do
+            NAME=$(basename "$artifact_dir" | sed 's/^firmware-//')
+            IFS='-' read -r DEVICE VIDEO_STANDARD DEBUG <<< "$NAME"
+
+            BOOTLOADER=$(find "$artifact_dir" -name "*.ino.bootloader.bin")
+            PARTITIONS=$(find "$artifact_dir" -name "*.ino.partitions.bin")
+            FIRMWARE=$(find "$artifact_dir" -name "*.ino.bin" ! -name "*.merged.bin" \
+                                                               ! -name "*.bootloader.bin" \
+                                                               ! -name "*.partitions.bin")
+
+            FW_DEST="binaries/composite/$VIDEO_STANDARD/$DEBUG"
+            mkdir -p "WebFlash/$FW_DEST"
+            cp "$BOOTLOADER" "WebFlash/$FW_DEST/bootloader.bin"
+            cp "$PARTITIONS" "WebFlash/$FW_DEST/partitions.bin"
+            cp "$FIRMWARE"   "WebFlash/$FW_DEST/firmware.bin"
+
+            for CONTROLLER in no_controller gpio nes snes psx uart; do
+              for SD_FREQ in $SD_FREQS; do
+                for DEMO_MODE in $DEMO_MODES; do
+                  case "$CONTROLLER" in
+                    no_controller) CONTROLLER_VAL=255 ;;
+                    gpio)          CONTROLLER_VAL=0   ;;
+                    nes)           CONTROLLER_VAL=1   ;;
+                    snes)          CONTROLLER_VAL=2   ;;
+                    psx)           CONTROLLER_VAL=3   ;;
+                    uart)          CONTROLLER_VAL=4   ;;
+                  esac
+                  case "$SD_FREQ" in sd_freq_80MHz) SD_VAL=80 ;; sd_freq_40MHz) SD_VAL=40 ;; esac
+                  case "$DEMO_MODE" in demo_mode_off) DM_VAL=0 ;; demo_mode_on) DM_VAL=1 ;; esac
+
+                  CFG_NAME="composite-$VIDEO_STANDARD-$CONTROLLER-$SD_FREQ-$DEBUG-$DEMO_MODE-config.bin"
+                  mkdir -p tmp/fs_stage
+                  printf "$(printf '\\%03o' 1 0 $CONTROLLER_VAL $SD_VAL 0 $DM_VAL)" \
+                      > tmp/fs_stage/runtime_config.bin
+                  mklittlefs -c tmp/fs_stage -s 0x0F000 "WebFlash/configs/$CFG_NAME"
+                  rm -rf tmp/fs_stage
+
+                  printf '{\n  "name": "Anemoia-ESP32",\n  "version": "1.0.0",\n  "funding_url": "https://ko-fi.com/manalotoshim",\n  "builds": [{\n    "chipFamily": "ESP32",\n    "parts": [\n      { "path": "../%s/bootloader.bin", "offset": 4096 },\n      { "path": "../%s/partitions.bin", "offset": 32768 },\n      { "path": "../%s/firmware.bin",   "offset": 65536 },\n      { "path": "../configs/%s",        "offset": 3866624 }\n    ]\n  }]\n}' \
+                    "$FW_DEST" "$FW_DEST" "$FW_DEST" "$CFG_NAME" \
+                    > "WebFlash/manifests/composite-$VIDEO_STANDARD-$CONTROLLER-$SD_FREQ-$DEBUG-$DEMO_MODE.json"
+                done
+              done
+            done
+          done
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: "./WebFlash"
+          retention-days: 1
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
